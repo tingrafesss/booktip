@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Калькулятор печати книги</title>
+  <link rel="stylesheet" href="/static/main.css?v=4" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Калькулятор печати книги</h1>
+    <p class="muted">Введите параметры ниже, нажмите «Рассчитать» — получите схему тетрадей. Затем загрузите файл и нажмите «Скачать».</p>
+
+    <div class="grid-2">
+      <!-- ПАРАМЕТРЫ -->
+      <div>
+        <h2>Параметры</h2>
+        <div class="card">
+          <form id="calcForm" onsubmit="return false;">
+            <div class="row">
+              <label>Формат книги</label>
+              <select name="page_format" id="pageFormatSelect">
+                <option value="A5" selected>A5 (148 × 210)</option>
+                <option value="Pocket">Pocket (107 × 174)</option>
+                <option value="A6">A6 (105 × 148)</option>
+                <option value="Custom">Свои размеры</option>
+              </select>
+              <div class="inline">
+                <input type="number" name="page_width_mm" value="148" step="0.1" />
+                ×
+                <input type="number" name="page_height_mm" value="210" step="0.1" />
+                <span class="muted">мм</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <label>Всего страниц</label>
+              <input type="number" name="total_pages" value="176" min="1" />
+            </div>
+
+            <div class="row">
+              <label>Листов на тетрадь (A4)</label>
+              <input type="number" name="sheets_per_signature" placeholder="например, 5" />
+            </div>
+
+            <div class="row">
+              <label>Количество тетрадей</label>
+              <input type="number" name="num_signatures" placeholder="(опционально)" />
+            </div>
+
+            <div class="row">
+              <label>
+                <input type="checkbox" name="duplex" checked />
+                Двусторонняя печать
+              </label>
+            </div>
+
+            <div class="row">
+              <label>Формат листа печати</label>
+              <select name="sheet_format" id="sheetFormatSelect">
+                <option value="A4" selected>A4</option>
+                <option value="Custom">Custom</option>
+              </select>
+              <div class="inline">
+                <input type="number" name="sheet_width_mm" value="210" step="0.1" />
+                ×
+                <input type="number" name="sheet_height_mm" value="297" step="0.1" />
+                <span class="muted">мм</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <label>Гиб (creep) мм/лист</label>
+              <input type="number" name="creep_mm_per_leaf" value="0.1" step="0.1" />
+            </div>
+
+            <div class="row">
+              <label>Плотность, gsm</label>
+              <input type="number" name="gsm" value="80" step="1" />
+            </div>
+
+            <!-- скрыто: реальный размер тетради (если не задали иначе) -->
+            <input type="hidden" name="signature_size" value="16" />
+
+            <button id="calcBtn" class="primary" type="button">Рассчитать</button>
+          </form>
+        </div>
+
+        <div id="plan" class="card hidden"></div>
+      </div>
+
+      <!-- ФАЙЛ И ВЫГРУЗКА -->
+      <div>
+        <h2>Файл и выгрузка</h2>
+        <div class="card">
+          <form id="fileForm" onsubmit="return false;">
+            <div class="row">
+              <label>Ваш файл (PDF/DOCX/EPUB/FB2)</label>
+              <input type="file" name="file" accept=".pdf,.docx,.epub,.fb2,.rtf,.odt,.mobi,.azw3" />
+            </div>
+
+            <div class="row">
+              <label>Поля (мм)</label>
+              <div class="inline">
+                <input type="number" name="margin_mm" value="0" step="0.5" />
+                <span class="muted">поля</span>
+                <input type="number" name="gutter_mm" value="0" step="0.5" />
+                <span class="muted">корешок</span>
+              </div>
+            </div>
+
+            <!-- ключи, которые мы подставляем автоматически из формы расчёта -->
+          </form>
+
+          <button id="downloadBtn" class="success" type="button">Скачать готовый файл</button>
+          <div id="msg" class="msg"></div>
+
+          <p class="small muted" style="margin-top:10px">
+            PDF — выдаётся сверстанный буклет (2-up на листе печати). DOCX/EPUB/FB2 — конвертируются в PDF
+            (если установлен LibreOffice/Calibre), затем раскладываются по тетрадям.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <p class="muted small" style="margin-top:24px">Сайт-шаблон: одна страница, без перезагрузок. Сделано специально под ваш кейс.</p>
+  </div>
+
+  <script src="/static/main.js?v=4"></script>
+</body>
+</html>

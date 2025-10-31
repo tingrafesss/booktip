@@ -3,8 +3,8 @@ FROM python:3.12-slim
 # LibreOffice для конвертации DOCX→PDF
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
-    fonts-dejavu-core \
-    locales \
+    poppler-utils \    
+    # ... твои пакеты ...
     && rm -rf /var/lib/apt/lists/*
 
 # Локаль (на всякий)

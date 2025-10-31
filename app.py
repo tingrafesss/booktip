@@ -1,10 +1,10 @@
-# app.py — бэкенд для расчёта и импозиции книги (экономная версия: только PDF, стрим в файл)
-import io
+# app.py — экономная по памяти версия: только PDF, приём и отдача через файлы
 import os
+import io
 import math
-import subprocess
 import tempfile
 import shutil
+import subprocess
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 
@@ -20,18 +20,14 @@ from reportlab.lib.units import mm  # 1 mm -> points
 # ---------------------------------------------------------------------
 # FastAPI setup
 # ---------------------------------------------------------------------
-app = FastAPI(title="Идеальная книга — калькулятор и верстка", version="2.1-stream")
+app = FastAPI(title="Идеальная книга — калькулятор и верстка", version="2.2-stream-file")
 BASE_DIR = os.path.dirname(__file__)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 # ---------------------------------------------------------------------
-# Utilities
+# Utils
 # ---------------------------------------------------------------------
-def has_cmd(cmd: str) -> bool:
-    from shutil import which
-    return which(cmd) is not None
-
 def run_quiet(args: list) -> int:
     try:
         return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -88,7 +84,7 @@ def build_plan(p: Params) -> Dict:
         signatures.append({"start": page, "end": page + sig - 1})
         page += sig
     if rem:
-        signatures.append({"start": page, "end": page + sig - 1})  # последняя с добивкой
+        signatures.append({"start": page, "end": page + sig - 1})
 
     sig_plans = []
     for sgn in signatures:
@@ -115,15 +111,12 @@ def build_plan(p: Params) -> Dict:
     }
 
 # ---------------------------------------------------------------------
-# PDF imposition — потоково (лист за листом) с дописыванием к файлу
+# PDF imposition — потоково, из файла-источника в файл-результат
 # ---------------------------------------------------------------------
-def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> None:
-    """
-    Экономная по памяти импозиция:
-    - создаём лист (две страницы) -> сохраняем во временный PDF
-    - дописываем его к out_path через `pdfunite` (из пакета poppler-utils)
-    """
-    reader = PdfReader(io.BytesIO(pdf_bytes))
+def impose_pdf_streaming_from_path(src_pdf_path: str, p: Params, out_path: str) -> None:
+    """Экономно по памяти: читаем исходник по пути, собираем лист за листом и
+    дописываем в out_path через `pdfunite` (нужен poppler-utils)."""
+    reader = PdfReader(src_pdf_path)
     total = len(reader.pages)
     plan = build_plan(p)
 
@@ -133,7 +126,6 @@ def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> 
     half_w = dst_width / 2.0
 
     with tempfile.TemporaryDirectory() as td:
-        # создаём пустой out_path
         open(out_path, "wb").close()
         have_any = False
 
@@ -145,10 +137,7 @@ def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> 
             else:
                 prev = os.path.join(td, "prev.pdf")
                 os.replace(out_pdf, prev)
-                # объединяем: prev + in_pdf -> out_pdf
-                ret = run_quiet(["pdfunite", prev, in_pdf, out_pdf])
-                if ret != 0:
-                    # на всякий случай восстановим предыдущую версию
+                if run_quiet(["pdfunite", prev, in_pdf, out_pdf]) != 0:
                     shutil.copyfile(prev, out_pdf)
                     raise RuntimeError("Не удалось склеить PDF (pdfunite)")
 
@@ -167,7 +156,7 @@ def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> 
                     left = get_src(left_num)
                     right = get_src(right_num)
 
-                    # если хочется, чтобы "оборот" выглядел визуально как при печати, раскомментируй:
+                    # если хочется «зеркало» на обороте — раскомментируй
                     # if side == "back":
                     #     left, right = right, left
 
@@ -183,7 +172,6 @@ def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> 
                         t = Transformation().scale(s, s).translate(half_w, 0)
                         dst.merge_transformed_page(right, t)
 
-                    # пишем текущий лист и тут же дописываем его к итоговому PDF
                     one_sheet = os.path.join(td, "sheet.pdf")
                     with open(one_sheet, "wb") as f:
                         writer.write(f)
@@ -192,8 +180,8 @@ def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def detect_pdf_pages(pdf_bytes: bytes) -> int:
-    return len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+def detect_pdf_pages_from_path(path: str) -> int:
+    return len(PdfReader(path).pages)
 
 # ---------------------------------------------------------------------
 # Routes
@@ -258,34 +246,27 @@ async def impose_endpoint(
     page_width_mm: float = Form(148),
     page_height_mm: float = Form(210),
 ):
-    # 1) читаем файл
-    try:
-        data = await file.read()
-    except Exception as e:
-        return JSONResponse({"error": f"Не удалось прочитать файл: {e}"}, status_code=400)
-
-    name = file.filename or "input"
+    # сохраняем загруженный файл сразу на диск (без чтения в память)
+    name = file.filename or "input.pdf"
     ext = (os.path.splitext(name)[1] or "").lower()
-
-    # Временно поддерживаем только PDF (экономим память, без LibreOffice)
     if ext != ".pdf":
         raise HTTPException(status_code=400, detail="Только PDF-файлы поддерживаются на данный момент")
 
-    pdf_bytes = data
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as src_tmp:
+        src_path = src_tmp.name
+        file.file.seek(0)
+        shutil.copyfileobj(file.file, src_tmp)  # потоково на диск
 
     try:
-        # 3) определяем фактическое число страниц
-        detected_pages = detect_pdf_pages(pdf_bytes)
+        detected_pages = detect_pdf_pages_from_path(src_path)
         total_pages = detected_pages if not total_pages_hint or total_pages_hint < detected_pages else total_pages_hint
 
-        # 4) финализируем размер тетради по приоритетам
         if sheets_per_signature and sheets_per_signature > 0:
             signature_size = int(sheets_per_signature) * 4
         elif num_signatures and num_signatures > 0:
             raw_sig = math.ceil(total_pages / num_signatures)
             signature_size = int(math.ceil(raw_sig / 4) * 4)
 
-        # 5) параметры для импозиции
         p = Params(
             total_pages=total_pages,
             signature_size=signature_size,
@@ -295,15 +276,13 @@ async def impose_endpoint(
             page_height_mm=page_height_mm,
         )
 
-        # валидация/добивка пустыми
         _ = build_plan(p)
 
-        # 6) генерим буклет во временный файл и отдаём потоково
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            out_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as out_tmp:
+            out_path = out_tmp.name
 
         try:
-            impose_pdf_streaming_to_path(pdf_bytes, p, out_path)
+            impose_pdf_streaming_from_path(src_path, p, out_path)
             if os.path.getsize(out_path) < 1000:
                 return JSONResponse({"error": "PDF сгенерирован пустым — проверьте исходный файл."}, status_code=500)
 
@@ -312,7 +291,7 @@ async def impose_endpoint(
             resp.headers["X-Signature-Size"] = str(p.signature_size)
             return resp
         finally:
-            # Файл удалится системой позже; можно добавить периодическую уборку, если захочешь
+            # временные файлы ОС сама уберёт; при желании можно организовать уборку crontab'ом
             pass
 
     except Exception as e:

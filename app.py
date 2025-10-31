@@ -1,4 +1,4 @@
-# app.py — бэкенд для расчёта и импозиции книги
+# app.py — бэкенд для расчёта и импозиции книги (временная версия: только PDF)
 import io
 import os
 import math
@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 
-from fastapi import FastAPI, UploadFile, Form, Request, File
+from fastapi import FastAPI, UploadFile, Form, Request, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -168,31 +168,14 @@ def impose_pdf_two_up(pdf_bytes: bytes, p: Params) -> bytes:
     return out.read()
 
 # ---------------------------------------------------------------------
-# Conversion helpers
+# Conversion helpers (оставлены на будущее, сейчас не используются)
 # ---------------------------------------------------------------------
 def detect_pdf_pages(pdf_bytes: bytes) -> int:
     return len(PdfReader(io.BytesIO(pdf_bytes)).pages)
 
 def convert_any_to_pdf(bytes_in: bytes, ext: str) -> Optional[bytes]:
-    """Конвертирует входной файл в PDF (LibreOffice/Calibre). Возвращает PDF-байты или None."""
+    """Заглушка/старый код конвертации. Не используется в этой версии."""
     with tempfile.TemporaryDirectory() as td:
-        in_path = os.path.join(td, "input"+ext)
-        with open(in_path, "wb") as f:
-            f.write(bytes_in)
-        out_pdf = os.path.join(td, "out.pdf")
-        ok = False
-        if has_cmd("soffice"):
-            code = run(["soffice","--headless","--convert-to","pdf","--outdir",td,in_path])
-            guess = os.path.join(td, os.path.splitext(os.path.basename(in_path))[0]+".pdf")
-            if code == 0 and os.path.exists(guess):
-                os.replace(guess, out_pdf)
-                ok = True
-        elif has_cmd("ebook-convert"):
-            run(["ebook-convert", in_path, out_pdf])
-            ok = os.path.exists(out_pdf)
-        if ok and os.path.exists(out_pdf):
-            with open(out_pdf, "rb") as f:
-                return f.read()
         return None
 
 # ---------------------------------------------------------------------
@@ -268,18 +251,13 @@ async def impose_endpoint(
     name = file.filename or "input"
     ext = (os.path.splitext(name)[1] or "").lower()
 
-    try:
-        # 2) получаем PDF-байты (PDF — сразу; DOCX/EPUB/FB2 — через конвертацию)
-        if ext == ".pdf":
-            pdf_bytes = data
-        else:
-            pdf_bytes = convert_any_to_pdf(data, ext)
-            if pdf_bytes is None:
-                return JSONResponse(
-                    {"error": "Формат не поддержан. Установите LibreOffice (`soffice`) или Calibre (`ebook-convert`) для конвертации в PDF."},
-                    status_code=400
-                )
+    # 🔒 ВРЕМЕННО: поддерживаем только PDF, без конвертации (экономим память)
+    if ext != ".pdf":
+        raise HTTPException(status_code=400, detail="Только PDF-файлы поддерживаются на данный момент")
 
+    pdf_bytes = data
+
+    try:
         # 3) определяем фактическое число страниц
         detected_pages = detect_pdf_pages(pdf_bytes)
         total_pages = detected_pages if not total_pages_hint or total_pages_hint < detected_pages else total_pages_hint

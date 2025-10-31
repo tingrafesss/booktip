@@ -1,25 +1,26 @@
 FROM python:3.12-slim
 
-# LibreOffice для конвертации DOCX→PDF
+# Утилита pdfunite (склейка PDF для "потоковой" импозиции)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libreoffice \
-    poppler-utils \    
-    # ... твои пакеты ...
-    && rm -rf /var/lib/apt/lists/*
+    poppler-utils \
+ && rm -rf /var/lib/apt/lists/*
 
-# Локаль (на всякий)
-RUN sed -i 's/# ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen && locale-gen
-ENV LANG=ru_RU.UTF-8 LC_ALL=ru_RU.UTF-8
+# Базовые переменные окружения и UTF-8
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
 WORKDIR /app
+
+# Сначала зависимости — так кэш лучше работает
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Затем код
 COPY . /app
 
-# Uvicorn слушает порт из окружения (Timeweb может пробрасывать свои порты)
-ENV PYTHONUNBUFFERED=1
+# Порт и запуск
 ENV PORT=8000
+CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
 
-EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

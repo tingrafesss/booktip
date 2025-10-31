@@ -1,16 +1,18 @@
-# app.py — бэкенд для расчёта и импозиции книги (временная версия: только PDF)
+# app.py — бэкенд для расчёта и импозиции книги (экономная версия: только PDF, стрим в файл)
 import io
 import os
 import math
 import subprocess
 import tempfile
+import shutil
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, Form, Request, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.responses import FileResponse
 
 from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.lib.units import mm  # 1 mm -> points
@@ -18,7 +20,7 @@ from reportlab.lib.units import mm  # 1 mm -> points
 # ---------------------------------------------------------------------
 # FastAPI setup
 # ---------------------------------------------------------------------
-app = FastAPI(title="Идеальная книга — калькулятор и верстка", version="2.0")
+app = FastAPI(title="Идеальная книга — калькулятор и верстка", version="2.1-stream")
 BASE_DIR = os.path.dirname(__file__)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -30,7 +32,7 @@ def has_cmd(cmd: str) -> bool:
     from shutil import which
     return which(cmd) is not None
 
-def run(args: list) -> int:
+def run_quiet(args: list) -> int:
     try:
         return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -49,7 +51,6 @@ class Params:
     sheet_format: str = "A4"
     sheet_width_mm: float = 210.0
     sheet_height_mm: float = 297.0
-    # формат КНИЖНОЙ страницы (для справки/будущих смещений)
     page_width_mm: float = 148.0
     page_height_mm: float = 210.0
     creep_mm_per_leaf: float = 0.1
@@ -59,7 +60,6 @@ def _round2(x: float) -> float:
     return round(x + 1e-9, 2)
 
 def page_order_for_signature(first: int, last: int) -> List[Dict]:
-    """Классическая типографская раскладка для одной тетради (размер тетради кратен 4)."""
     s = last - first + 1
     assert s % 4 == 0
     sheets = []
@@ -82,7 +82,6 @@ def build_plan(p: Params) -> Dict:
     rem = total % sig
     padded_total = total if rem == 0 else total + (sig - rem)
 
-    # список тетрадей (диапазоны страниц)
     signatures = []
     page = 1
     for _ in range(full):
@@ -91,7 +90,6 @@ def build_plan(p: Params) -> Dict:
     if rem:
         signatures.append({"start": page, "end": page + sig - 1})  # последняя с добивкой
 
-    # листовой план каждой тетради
     sig_plans = []
     for sgn in signatures:
         sheets = page_order_for_signature(sgn["start"], sgn["end"])
@@ -100,9 +98,8 @@ def build_plan(p: Params) -> Dict:
     pages_per_sheet = p.pages_per_sheet_side * (2 if p.duplex else 1)
     sheets_needed = padded_total // pages_per_sheet
 
-    # прикидки по корешку и макс. уводу
     caliper_map = {60:0.08,70:0.09,80:0.1,90:0.11,100:0.12,115:0.135,120:0.145,130:0.155,150:0.175}
-    leaf_thickness = caliper_map.get(p.gsm, 0.1)  # мм на лист
+    leaf_thickness = caliper_map.get(p.gsm, 0.1)
     spine_mm = _round2((padded_total/2) * leaf_thickness)
     max_creep = _round2((sig/2) * p.creep_mm_per_leaf)
 
@@ -118,65 +115,85 @@ def build_plan(p: Params) -> Dict:
     }
 
 # ---------------------------------------------------------------------
-# PDF imposition (2-up на лист печати в горизонтальной ориентации)
+# PDF imposition — потоково (лист за листом) с дописыванием к файлу
 # ---------------------------------------------------------------------
-def impose_pdf_two_up(pdf_bytes: bytes, p: Params) -> bytes:
+def impose_pdf_streaming_to_path(pdf_bytes: bytes, p: Params, out_path: str) -> None:
+    """
+    Экономная по памяти импозиция:
+    - создаём лист (две страницы) -> сохраняем во временный PDF
+    - дописываем его к out_path через `pdfunite` (из пакета poppler-utils)
+    """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
-
     plan = build_plan(p)
 
-    sheet_w_pt = p.sheet_width_mm * mm   # 210 мм -> 595 pt
-    sheet_h_pt = p.sheet_height_mm * mm  # 297 мм -> 842 pt
-
-    # Горизонтальная ориентация (ландшафт): ширина и высота меняются местами
-    dst_width = sheet_h_pt
-    dst_height = sheet_w_pt
+    sheet_w_pt = p.sheet_width_mm * mm
+    sheet_h_pt = p.sheet_height_mm * mm
+    dst_width, dst_height = sheet_h_pt, sheet_w_pt
     half_w = dst_width / 2.0
 
-    writer = PdfWriter()
+    with tempfile.TemporaryDirectory() as td:
+        # создаём пустой out_path
+        open(out_path, "wb").close()
+        have_any = False
 
-    def get_src(n: int):
-        if 1 <= n <= total:
-            return reader.pages[n-1]
-        return None  # пустая, если добивка
+        def append_pdf(in_pdf: str, out_pdf: str):
+            nonlocal have_any
+            if not have_any:
+                shutil.copyfile(in_pdf, out_pdf)
+                have_any = True
+            else:
+                prev = os.path.join(td, "prev.pdf")
+                os.replace(out_pdf, prev)
+                # объединяем: prev + in_pdf -> out_pdf
+                ret = run_quiet(["pdfunite", prev, in_pdf, out_pdf])
+                if ret != 0:
+                    # на всякий случай восстановим предыдущую версию
+                    shutil.copyfile(prev, out_pdf)
+                    raise RuntimeError("Не удалось склеить PDF (pdfunite)")
 
-    for sig in plan["signatures"]:
-        for sheet in sig["sheets"]:
-            for side in ("front","back"):
-                dst = writer.add_blank_page(width=dst_width, height=dst_height)
+        def get_src(n: int):
+            if 1 <= n <= total:
+                return reader.pages[n-1]
+            return None
 
-                left_num, right_num = sheet[side]
-                left = get_src(left_num)
-                right = get_src(right_num)
+        for sig in plan["signatures"]:
+            for sheet in sig["sheets"]:
+                for side in ("front", "back"):
+                    writer = PdfWriter()
+                    dst = writer.add_blank_page(width=dst_width, height=dst_height)
 
-                if left is not None:
-                    lw, lh = float(left.mediabox.width), float(left.mediabox.height)
-                    s = min(half_w / lw, dst_height / lh)
-                    t = Transformation().scale(s, s).translate(0, 0)
-                    dst.merge_transformed_page(left, t)
+                    left_num, right_num = sheet[side]
+                    left = get_src(left_num)
+                    right = get_src(right_num)
 
-                if right is not None:
-                    rw, rh = float(right.mediabox.width), float(right.mediabox.height)
-                    s = min(half_w / rw, dst_height / rh)
-                    t = Transformation().scale(s, s).translate(half_w, 0)
-                    dst.merge_transformed_page(right, t)
+                    # если хочется, чтобы "оборот" выглядел визуально как при печати, раскомментируй:
+                    # if side == "back":
+                    #     left, right = right, left
 
-    out = io.BytesIO()
-    writer.write(out)
-    out.seek(0)
-    return out.read()
+                    if left is not None:
+                        lw, lh = float(left.mediabox.width), float(left.mediabox.height)
+                        s = min(half_w / lw, dst_height / lh)
+                        t = Transformation().scale(s, s).translate(0, 0)
+                        dst.merge_transformed_page(left, t)
+
+                    if right is not None:
+                        rw, rh = float(right.mediabox.width), float(right.mediabox.height)
+                        s = min(half_w / rw, dst_height / rh)
+                        t = Transformation().scale(s, s).translate(half_w, 0)
+                        dst.merge_transformed_page(right, t)
+
+                    # пишем текущий лист и тут же дописываем его к итоговому PDF
+                    one_sheet = os.path.join(td, "sheet.pdf")
+                    with open(one_sheet, "wb") as f:
+                        writer.write(f)
+                    append_pdf(one_sheet, out_path)
 
 # ---------------------------------------------------------------------
-# Conversion helpers (оставлены на будущее, сейчас не используются)
+# Helpers
 # ---------------------------------------------------------------------
 def detect_pdf_pages(pdf_bytes: bytes) -> int:
     return len(PdfReader(io.BytesIO(pdf_bytes)).pages)
-
-def convert_any_to_pdf(bytes_in: bytes, ext: str) -> Optional[bytes]:
-    """Заглушка/старый код конвертации. Не используется в этой версии."""
-    with tempfile.TemporaryDirectory() as td:
-        return None
 
 # ---------------------------------------------------------------------
 # Routes
@@ -188,9 +205,9 @@ async def index(request: Request):
 @app.post("/calculate")
 async def calculate_endpoint(
     total_pages: int = Form(...),
-    signature_size: int = Form(16),                   # размер тетради (стр)
-    sheets_per_signature: Optional[int] = Form(None), # листов A4 на тетрадь (приоритет)
-    num_signatures: Optional[int] = Form(None),       # количество тетрадей (второй приоритет)
+    signature_size: int = Form(16),
+    sheets_per_signature: Optional[int] = Form(None),
+    num_signatures: Optional[int] = Form(None),
     pages_per_sheet_side: int = Form(2),
     duplex: bool = Form(True),
     page_format: str = Form("A5"),
@@ -202,7 +219,6 @@ async def calculate_endpoint(
     creep_mm_per_leaf: float = Form(0.1),
     gsm: int = Form(80),
 ):
-    # Приоритет: листов на тетрадь → число тетрадей → явный размер тетради
     if sheets_per_signature and sheets_per_signature > 0:
         signature_size = int(sheets_per_signature) * 4
     elif num_signatures and num_signatures > 0:
@@ -251,7 +267,7 @@ async def impose_endpoint(
     name = file.filename or "input"
     ext = (os.path.splitext(name)[1] or "").lower()
 
-    # 🔒 ВРЕМЕННО: поддерживаем только PDF, без конвертации (экономим память)
+    # Временно поддерживаем только PDF (экономим память, без LibreOffice)
     if ext != ".pdf":
         raise HTTPException(status_code=400, detail="Только PDF-файлы поддерживаются на данный момент")
 
@@ -268,7 +284,6 @@ async def impose_endpoint(
         elif num_signatures and num_signatures > 0:
             raw_sig = math.ceil(total_pages / num_signatures)
             signature_size = int(math.ceil(raw_sig / 4) * 4)
-        # иначе берём переданный signature_size
 
         # 5) параметры для импозиции
         p = Params(
@@ -283,18 +298,22 @@ async def impose_endpoint(
         # валидация/добивка пустыми
         _ = build_plan(p)
 
-        # 6) генерим буклет
-        imposed = impose_pdf_two_up(pdf_bytes, p)
-        if not imposed or len(imposed) < 1000:
-            return JSONResponse({"error": "PDF сгенерирован пустым — проверьте исходный файл."}, status_code=500)
+        # 6) генерим буклет во временный файл и отдаём потоково
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            out_path = tmp.name
 
-        headers = {
-            "Content-Disposition": 'attachment; filename="booklet.pdf"',
-            "Content-Type": "application/pdf",
-            "X-Detected-Pages": str(detected_pages),
-            "X-Signature-Size": str(p.signature_size),
-        }
-        return StreamingResponse(io.BytesIO(imposed), media_type="application/pdf", headers=headers)
+        try:
+            impose_pdf_streaming_to_path(pdf_bytes, p, out_path)
+            if os.path.getsize(out_path) < 1000:
+                return JSONResponse({"error": "PDF сгенерирован пустым — проверьте исходный файл."}, status_code=500)
+
+            resp = FileResponse(path=out_path, media_type="application/pdf", filename="booklet.pdf")
+            resp.headers["X-Detected-Pages"] = str(detected_pages)
+            resp.headers["X-Signature-Size"] = str(p.signature_size)
+            return resp
+        finally:
+            # Файл удалится системой позже; можно добавить периодическую уборку, если захочешь
+            pass
 
     except Exception as e:
         return JSONResponse({"error": f"Сбой при подготовке PDF: {e}"}, status_code=500)
